@@ -482,8 +482,39 @@ def fetch_private_access_token(client: TLSClient, shop_url: str, checkout_url: s
 # ──────────────────────── Step 3: actions JS ─────────────────────────
 
 def extract_actions_js_url(checkout_html: str, shop_url: str) -> str:
-    match = re.search(r'(/cdn/shopifycloud/checkout-web/assets/c1/actions[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.js)', checkout_html)
-    return shop_url + match.group(1) if match else ""
+    # نمط 1: الأصلي
+    match = re.search(
+        r'(/cdn/shopifycloud/checkout-web/assets/c1/actions[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.js)',
+        checkout_html
+    )
+    if match:
+        return shop_url + match.group(1)
+    
+    # نمط 2: من غير c1
+    match = re.search(
+        r'(/cdn/shopifycloud/checkout-web/assets/actions[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.js)',
+        checkout_html
+    )
+    if match:
+        return shop_url + match.group(1)
+    
+    # نمط 3: أي ملف JS فيه actions
+    match = re.search(
+        r'"(/cdn/shopifycloud/[^"]*actions[^"]*\.js)"',
+        checkout_html
+    )
+    if match:
+        return shop_url + match.group(1)
+    
+    # نمط 4: أي ملف JS في checkout-web/assets (fallback)
+    match = re.search(
+        r'"(/cdn/shopifycloud/checkout-web/assets/[^"]+\.js)"',
+        checkout_html
+    )
+    if match:
+        return shop_url + match.group(1)
+    
+    return ""
 
 def fetch_actions_js(client: TLSClient, actions_url: str, shop_url: str) -> str:
     headers = {
