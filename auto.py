@@ -255,10 +255,6 @@ class TLSClient:
         self.close()
 
 # ═══════════════════════════════════════════════════════════════════
-# ❌ تم حذف قسم Site fetching بالكامل (WORKING_SITES_API اتشال)
-# ═══════════════════════════════════════════════════════════════════
-
-# ═══════════════════════════════════════════════════════════════════
 # Step 0: أرخص منتج — بـ 3 طرق
 # ═══════════════════════════════════════════════════════════════════
 
@@ -266,7 +262,7 @@ _product_cache: Dict[tuple, tuple] = {}
 _product_cache_lock = threading.Lock()
 _PRODUCT_CACHE_TTL  = 600
 
-MAX_PRODUCT_PAGES = 10   # 10 × 250 = 2500 منتج
+MAX_PRODUCT_PAGES = 10
 
 
 def _fetch_products_json_page(client: TLSClient, shop_url: str, page: int = 1) -> list:
@@ -352,7 +348,6 @@ def find_cheapest_product(client: TLSClient, shop_url: str,
     all_products: list = []
     last_error: Exception = None
 
-    # ── الطريقة 1: products.json ──
     try:
         for page in range(1, MAX_PRODUCT_PAGES + 1):
             try:
@@ -369,7 +364,6 @@ def find_cheapest_product(client: TLSClient, shop_url: str,
     except Exception as e:
         last_error = e
 
-    # ── الطريقة 2: sitemap ──
     if not all_products:
         try:
             sm_products = _fetch_products_from_sitemap(client, shop_url)
@@ -378,7 +372,6 @@ def find_cheapest_product(client: TLSClient, shop_url: str,
         except Exception as e:
             last_error = e
 
-    # ── الطريقة 3: /collections/all ──
     if not all_products:
         try:
             col_products = _fetch_products_from_collections(client, shop_url)
@@ -482,65 +475,8 @@ def fetch_private_access_token(client: TLSClient, shop_url: str, checkout_url: s
 # ──────────────────────── Step 3: actions JS ─────────────────────────
 
 def extract_actions_js_url(checkout_html: str, shop_url: str) -> str:
-    """بيدور على ملف actions القديم، ولو ملقاش بيرجع أي ملف JS رئيسي من الـ import map."""
-    # النمط القديم — actions.js
-    match = re.search(
-        r'(/cdn/shopifycloud/checkout-web/assets/c1/actions[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.js)',
-        checkout_html
-    )
-    if match:
-        return shop_url + match.group(1)
-
-    # النمط الجديد — app.js أو أي ملف رئيسي في c1/
-    # نرجع قائمة كل الملفات المحتملة
-    candidates = re.findall(
-        r'"(/cdn/shopifycloud/checkout-web/assets/c1/(?:app|[a-f0-9]{6,10})\.[A-Za-z0-9_-]+\.js)"',
-        checkout_html
-    )
-    if candidates:
-        # نرجّع أول واحد (بيتعامل معاه في fetch_actions_js)
-        return shop_url + candidates[0]
-
-    # fallback أخير — أي ملف JS في c1/
-    match = re.search(
-        r'"(/cdn/shopifycloud/checkout-web/assets/c1/[^"]+\.js)"',
-        checkout_html
-    )
-    if match:
-        return shop_url + match.group(1)
-
-    return ""
-
-
-def extract_all_js_candidates(checkout_html: str, shop_url: str) -> list[str]:
-    """بيرجع كل ملفات JS الرئيسية اللي ممكن يكون فيها الـ GraphQL IDs."""
-    candidates = re.findall(
-        r'"(/cdn/shopifycloud/checkout-web/assets/c1/[^"]+\.js)"',
-        checkout_html
-    )
-    # فلترة: شيل ملفات assets/ الفرعية، سيبه الملفات الرئيسية بس
-    result = []
-    seen = set()
-    for c in candidates:
-        if "/assets/" in c:  # دي ملفات صغيرة (components)
-            continue
-        if c in seen:
-            continue
-        seen.add(c)
-        result.append(shop_url + c)
-    return result
-
-
-def is_development_shop(checkout_html: str) -> bool:
-    """بيكشف إن الموقع dev shop (Shopify بتمنع checkout فيه)."""
-    return ('"developmentShop":true' in checkout_html or
-            '"developmentShop": true' in checkout_html)
-
-
-def has_no_payment_gateways(checkout_html: str) -> bool:
-    """بيكشف إن مفيش payment gateways متاحة."""
-    return ('"paymentGateways":[]' in checkout_html or
-            '"paymentGateways": []' in checkout_html)
+    match = re.search(r'(/cdn/shopifycloud/checkout-web/assets/c1/actions[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.js)', checkout_html)
+    return shop_url + match.group(1) if match else ""
 
 def fetch_actions_js(client: TLSClient, actions_url: str, shop_url: str) -> str:
     headers = {
@@ -582,31 +518,43 @@ def extract_poll_for_receipt_id(js_body: str) -> str:
             return match.group(1)
     return ""
 
-def find_graphql_ids_in_html_and_js(client, checkout_html: str, shop_url: str) -> tuple[str, str]:
-    """
-    بيدور على Proposal و SubmitForCompletion IDs في:
-    1. meta serialized-graphql
-    2. ملفات JS الرئيسية في c1/
-    """
+
+# ──────────────────────── ✅ NEW: import map support ─────────────────
+
+def extract_all_js_candidates(checkout_html: str, shop_url: str) -> list:
+    """بيرجع كل ملفات JS الرئيسية اللي ممكن يكون فيها الـ GraphQL IDs."""
+    candidates = re.findall(
+        r'"(/cdn/shopifycloud/checkout-web/assets/c1/[^"]+\.js)"',
+        checkout_html
+    )
+    result = []
+    seen = set()
+    for c in candidates:
+        if "/assets/" in c:
+            continue
+        if c in seen:
+            continue
+        seen.add(c)
+        result.append(shop_url + c)
+    return result
+
+
+def find_graphql_ids_in_html_and_js(client, checkout_html: str, shop_url: str):
+    """بيدور على Proposal و SubmitForCompletion IDs في ملفات JS الرئيسية."""
     proposal_id = ""
-    submit_id = ""
+    submit_id   = ""
 
-    # ── المحاولة 1: من meta tag مباشرة ──
-    try:
-        m = re.search(r'<meta name="serialized-graphql" content="([^"]*)"', checkout_html)
-        if m:
-            content = html.unescape(m.group(1))
-            # كل persisted query ID = 64-char hex
-            all_ids = re.findall(r'"([a-f0-9]{64})\{', content)
-            # مش هنعرف أي واحد هو Proposal، بس هنحاول
-            # نستخدم آخر IDs لو مفيش JS
-    except Exception:
-        pass
-
-    # ── المحاولة 2: من ملفات JS ──
     js_urls = extract_all_js_candidates(checkout_html, shop_url)
 
-    for url in js_urls[:30]:  # جرب أول 30 ملف
+    priority = []
+    for url in js_urls:
+        if "/app." in url or "/2c1ab0fe." in url or "/4b4bc88f." in url or "/9f28056f." in url:
+            priority.append(url)
+
+    rest = [u for u in js_urls if u not in priority]
+    ordered = priority + rest
+
+    for url in ordered[:40]:
         if proposal_id and submit_id:
             break
         try:
@@ -621,43 +569,44 @@ def find_graphql_ids_in_html_and_js(client, checkout_html: str, shop_url: str) -
             continue
 
         if not proposal_id:
-            m = re.search(
+            for pat in [
                 r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"query"\s*,\s*name:\s*"Proposal"',
-                js_body
-            )
-            if not m:
-                # نمط بديل
-                m = re.search(
-                    r'name:\s*"Proposal"\s*,\s*type:\s*"query"\s*,\s*id:\s*"([a-f0-9]{64})"',
-                    js_body
-                )
-            if not m:
-                m = re.search(
-                    r'"Proposal"[^}]{0,200}?id:\s*"([a-f0-9]{64})"',
-                    js_body
-                )
-            if m:
-                proposal_id = m.group(1)
+                r'name:\s*"Proposal"\s*,\s*type:\s*"query"\s*,\s*id:\s*"([a-f0-9]{64})"',
+                r'"Proposal"\s*,\s*(?:type:\s*"query"\s*,\s*)?id:\s*"([a-f0-9]{64})"',
+                r'id:\s*"([a-f0-9]{64})"\s*,\s*name:\s*"Proposal"',
+                r'"name"\s*:\s*"Proposal"[^}]{0,500}?"id"\s*:\s*"([a-f0-9]{64})"',
+            ]:
+                m = re.search(pat, js_body)
+                if m:
+                    proposal_id = m.group(1)
+                    break
 
         if not submit_id:
-            m = re.search(
+            for pat in [
                 r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"mutation"\s*,\s*name:\s*"SubmitForCompletion"',
-                js_body
-            )
-            if not m:
-                m = re.search(
-                    r'name:\s*"SubmitForCompletion"\s*,\s*type:\s*"mutation"\s*,\s*id:\s*"([a-f0-9]{64})"',
-                    js_body
-                )
-            if not m:
-                m = re.search(
-                    r'"SubmitForCompletion"[^}]{0,200}?id:\s*"([a-f0-9]{64})"',
-                    js_body
-                )
-            if m:
-                submit_id = m.group(1)
+                r'name:\s*"SubmitForCompletion"\s*,\s*type:\s*"mutation"\s*,\s*id:\s*"([a-f0-9]{64})"',
+                r'"SubmitForCompletion"\s*,\s*(?:type:\s*"mutation"\s*,\s*)?id:\s*"([a-f0-9]{64})"',
+                r'id:\s*"([a-f0-9]{64})"\s*,\s*name:\s*"SubmitForCompletion"',
+                r'"name"\s*:\s*"SubmitForCompletion"[^}]{0,500}?"id"\s*:\s*"([a-f0-9]{64})"',
+            ]:
+                m = re.search(pat, js_body)
+                if m:
+                    submit_id = m.group(1)
+                    break
 
     return proposal_id, submit_id
+
+
+def is_development_shop(checkout_html: str) -> bool:
+    """بيكشف إن الموقع dev shop (Shopify بتمنع checkout فيه)."""
+    return ('"developmentShop":true' in checkout_html or
+            '"developmentShop": true' in checkout_html)
+
+
+def has_no_payment_gateways(checkout_html: str) -> bool:
+    """بيكشف إن مفيش payment gateways متاحة."""
+    return ('"paymentGateways":[]' in checkout_html or
+            '"paymentGateways": []' in checkout_html)
 
 
 # ──────────────────────── Extraction helpers ─────────────────────────
@@ -702,7 +651,6 @@ def extract_pci_session_id(pci_body: str) -> str:
     return match.group(1) if match else ""
 
 
-# ✅ extract_delivery_handle — 11 طريقة
 def extract_delivery_handle(proposal_body: str) -> str:
     patterns = [
         r'"selectedDeliveryStrategy"\s*:\s*\{\s*"handle"\s*:\s*"([^"]+)"\s*,\s*"__typename"\s*:\s*"CompleteDeliveryStrategy"',
@@ -1441,8 +1389,6 @@ def send_proposal3(client: TLSClient, shop_url: str, checkout_url: str, checkout
         headers=_proposal_headers(shop_url, checkout_url, checkout_token, session_token, build_id, source_token)
     )
     return resp.status_code, resp.text
-
-
 # ──────────────────────── Step 10: SubmitForCompletion ───────────────
 
 def send_poll_for_receipt(client: TLSClient, shop_url: str, checkout_url: str, checkout_token: str,
@@ -1721,15 +1667,40 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
             result.error = Exception(f"Step 2 failed: {e}")
             return result
 
+        # ✅ Step 3: مع كشف development shop + payment gateways
         try:
+            if is_development_shop(checkout_html):
+                result.retryable = False
+                result.error = Exception("development shop — checkout disabled by Shopify")
+                return result
+
+            if has_no_payment_gateways(checkout_html):
+                result.retryable = False
+                result.error = Exception("no payment gateways available")
+                return result
+
+            proposal_id = ""
+            submit_id   = ""
+
+            # محاولة 1: actions.js القديم
             actions_url = extract_actions_js_url(checkout_html, shop_url)
-            if not actions_url:
-                raise Exception("could not find actions JS URL")
-            js_body     = fetch_actions_js(client, actions_url, shop_url)
-            proposal_id = extract_proposal_id(js_body)
-            submit_id   = extract_submit_for_completion_id(js_body)
+            if actions_url and "actions" in actions_url:
+                try:
+                    js_body     = fetch_actions_js(client, actions_url, shop_url)
+                    proposal_id = extract_proposal_id(js_body)
+                    submit_id   = extract_submit_for_completion_id(js_body)
+                except Exception:
+                    pass
+
+            # ✅ محاولة 2: import map الجديد
             if not proposal_id or not submit_id:
-                raise Exception("missing Proposal or Submit ID")
+                proposal_id, submit_id = find_graphql_ids_in_html_and_js(
+                    client, checkout_html, shop_url
+                )
+
+            if not proposal_id or not submit_id:
+                raise Exception("could not find Proposal/SubmitForCompletion IDs in any JS file")
+
             poll_for_receipt_id = "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
         except Exception as e:
             result.retryable = True
@@ -2001,7 +1972,6 @@ def run_check(client: TLSClient, shop_url: str, site_name: str,
                         pass
                 time.sleep(min(delay, 300) / 1000.0)
 
-            # ✅ خلصت المحاولات ولسه ProcessingReceipt → صنّفه كـ ERROR (retry)
             result.status      = CheckStatus.ERROR
             result.status_code = "PROCESSING"
             result.error       = Exception("PROCESSING")
@@ -2166,15 +2136,40 @@ def run_checkout_for_card(shop_url: str, card_entry: str, proxy_url: str = "") -
             result.error = Exception(f"Step 2 failed: {e}")
             return result
 
+        # ✅ Step 3 مع الفحوصات الجديدة
         try:
+            if is_development_shop(checkout_html):
+                result.status = CheckStatus.ERROR
+                result.retryable = False
+                result.error = Exception("development shop — checkout disabled by Shopify")
+                return result
+
+            if has_no_payment_gateways(checkout_html):
+                result.status = CheckStatus.ERROR
+                result.retryable = False
+                result.error = Exception("no payment gateways available")
+                return result
+
+            proposal_id = ""
+            submit_id   = ""
+
             actions_url = extract_actions_js_url(checkout_html, shop_url)
-            if not actions_url:
-                raise Exception("could not find actions JS URL")
-            js_body = fetch_actions_js(client, actions_url, shop_url)
-            proposal_id = extract_proposal_id(js_body)
-            submit_id = extract_submit_for_completion_id(js_body)
+            if actions_url and "actions" in actions_url:
+                try:
+                    js_body = fetch_actions_js(client, actions_url, shop_url)
+                    proposal_id = extract_proposal_id(js_body)
+                    submit_id = extract_submit_for_completion_id(js_body)
+                except Exception:
+                    pass
+
             if not proposal_id or not submit_id:
-                raise Exception("missing Proposal or Submit ID")
+                proposal_id, submit_id = find_graphql_ids_in_html_and_js(
+                    client, checkout_html, shop_url
+                )
+
+            if not proposal_id or not submit_id:
+                raise Exception("could not find Proposal/SubmitForCompletion IDs in any JS file")
+
             poll_for_receipt_id = "978b340f3027dc55313349c4089004147b6b0dccee75e42ed97685ef1feae418"
         except Exception as e:
             result.status = CheckStatus.ERROR
@@ -2437,7 +2432,6 @@ def run_checkout_for_card(shop_url: str, card_entry: str, proxy_url: str = "") -
                 result.error = Exception(f"poll {poll_num} failed: {e}")
                 return result
 
-        # ✅ خلصت المحاولات ولسه ProcessingReceipt → ERROR (retry)
         result.status      = CheckStatus.ERROR
         result.status_code = "PROCESSING"
         result.error       = Exception("PROCESSING")
