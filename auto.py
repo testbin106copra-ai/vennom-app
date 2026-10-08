@@ -482,39 +482,65 @@ def fetch_private_access_token(client: TLSClient, shop_url: str, checkout_url: s
 # ──────────────────────── Step 3: actions JS ─────────────────────────
 
 def extract_actions_js_url(checkout_html: str, shop_url: str) -> str:
-    # نمط 1: الأصلي
+    """بيدور على ملف actions القديم، ولو ملقاش بيرجع أي ملف JS رئيسي من الـ import map."""
+    # النمط القديم — actions.js
     match = re.search(
         r'(/cdn/shopifycloud/checkout-web/assets/c1/actions[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.js)',
         checkout_html
     )
     if match:
         return shop_url + match.group(1)
-    
-    # نمط 2: من غير c1
+
+    # النمط الجديد — app.js أو أي ملف رئيسي في c1/
+    # نرجع قائمة كل الملفات المحتملة
+    candidates = re.findall(
+        r'"(/cdn/shopifycloud/checkout-web/assets/c1/(?:app|[a-f0-9]{6,10})\.[A-Za-z0-9_-]+\.js)"',
+        checkout_html
+    )
+    if candidates:
+        # نرجّع أول واحد (بيتعامل معاه في fetch_actions_js)
+        return shop_url + candidates[0]
+
+    # fallback أخير — أي ملف JS في c1/
     match = re.search(
-        r'(/cdn/shopifycloud/checkout-web/assets/actions[A-Za-z0-9_-]*\.[A-Za-z0-9_-]+\.js)',
+        r'"(/cdn/shopifycloud/checkout-web/assets/c1/[^"]+\.js)"',
         checkout_html
     )
     if match:
         return shop_url + match.group(1)
-    
-    # نمط 3: أي ملف JS فيه actions
-    match = re.search(
-        r'"(/cdn/shopifycloud/[^"]*actions[^"]*\.js)"',
-        checkout_html
-    )
-    if match:
-        return shop_url + match.group(1)
-    
-    # نمط 4: أي ملف JS في checkout-web/assets (fallback)
-    match = re.search(
-        r'"(/cdn/shopifycloud/checkout-web/assets/[^"]+\.js)"',
-        checkout_html
-    )
-    if match:
-        return shop_url + match.group(1)
-    
+
     return ""
+
+
+def extract_all_js_candidates(checkout_html: str, shop_url: str) -> list[str]:
+    """بيرجع كل ملفات JS الرئيسية اللي ممكن يكون فيها الـ GraphQL IDs."""
+    candidates = re.findall(
+        r'"(/cdn/shopifycloud/checkout-web/assets/c1/[^"]+\.js)"',
+        checkout_html
+    )
+    # فلترة: شيل ملفات assets/ الفرعية، سيبه الملفات الرئيسية بس
+    result = []
+    seen = set()
+    for c in candidates:
+        if "/assets/" in c:  # دي ملفات صغيرة (components)
+            continue
+        if c in seen:
+            continue
+        seen.add(c)
+        result.append(shop_url + c)
+    return result
+
+
+def is_development_shop(checkout_html: str) -> bool:
+    """بيكشف إن الموقع dev shop (Shopify بتمنع checkout فيه)."""
+    return ('"developmentShop":true' in checkout_html or
+            '"developmentShop": true' in checkout_html)
+
+
+def has_no_payment_gateways(checkout_html: str) -> bool:
+    """بيكشف إن مفيش payment gateways متاحة."""
+    return ('"paymentGateways":[]' in checkout_html or
+            '"paymentGateways": []' in checkout_html)
 
 def fetch_actions_js(client: TLSClient, actions_url: str, shop_url: str) -> str:
     headers = {
@@ -555,6 +581,83 @@ def extract_poll_for_receipt_id(js_body: str) -> str:
         if match:
             return match.group(1)
     return ""
+
+def find_graphql_ids_in_html_and_js(client, checkout_html: str, shop_url: str) -> tuple[str, str]:
+    """
+    بيدور على Proposal و SubmitForCompletion IDs في:
+    1. meta serialized-graphql
+    2. ملفات JS الرئيسية في c1/
+    """
+    proposal_id = ""
+    submit_id = ""
+
+    # ── المحاولة 1: من meta tag مباشرة ──
+    try:
+        m = re.search(r'<meta name="serialized-graphql" content="([^"]*)"', checkout_html)
+        if m:
+            content = html.unescape(m.group(1))
+            # كل persisted query ID = 64-char hex
+            all_ids = re.findall(r'"([a-f0-9]{64})\{', content)
+            # مش هنعرف أي واحد هو Proposal، بس هنحاول
+            # نستخدم آخر IDs لو مفيش JS
+    except Exception:
+        pass
+
+    # ── المحاولة 2: من ملفات JS ──
+    js_urls = extract_all_js_candidates(checkout_html, shop_url)
+
+    for url in js_urls[:30]:  # جرب أول 30 ملف
+        if proposal_id and submit_id:
+            break
+        try:
+            resp = client.get(url, headers={
+                "accept": "*/*",
+                "referer": shop_url + "/",
+            }, timeout=8)
+            if resp.status_code != 200:
+                continue
+            js_body = resp.text
+        except Exception:
+            continue
+
+        if not proposal_id:
+            m = re.search(
+                r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"query"\s*,\s*name:\s*"Proposal"',
+                js_body
+            )
+            if not m:
+                # نمط بديل
+                m = re.search(
+                    r'name:\s*"Proposal"\s*,\s*type:\s*"query"\s*,\s*id:\s*"([a-f0-9]{64})"',
+                    js_body
+                )
+            if not m:
+                m = re.search(
+                    r'"Proposal"[^}]{0,200}?id:\s*"([a-f0-9]{64})"',
+                    js_body
+                )
+            if m:
+                proposal_id = m.group(1)
+
+        if not submit_id:
+            m = re.search(
+                r'id:\s*"([a-f0-9]{64})"\s*,\s*type:\s*"mutation"\s*,\s*name:\s*"SubmitForCompletion"',
+                js_body
+            )
+            if not m:
+                m = re.search(
+                    r'name:\s*"SubmitForCompletion"\s*,\s*type:\s*"mutation"\s*,\s*id:\s*"([a-f0-9]{64})"',
+                    js_body
+                )
+            if not m:
+                m = re.search(
+                    r'"SubmitForCompletion"[^}]{0,200}?id:\s*"([a-f0-9]{64})"',
+                    js_body
+                )
+            if m:
+                submit_id = m.group(1)
+
+    return proposal_id, submit_id
 
 
 # ──────────────────────── Extraction helpers ─────────────────────────
