@@ -64,9 +64,8 @@ _SITE_TTL = {
     "could not extract session": 300,
     "curl: (28)":                 90,
     "Step 0 failed":              90,
-    # ✅ NEW: dev shop + no payment gateways (تتجاهلهم لمدة 24 ساعة)
-    "development shop":        86400,
-    "no payment gateways":     86400,
+    "development shop":        86400,   # ← NEW
+    "no payment gateways":     86400,   # ← NEW
 }
 
 _dead_sites: dict[str, float] = {}
@@ -117,8 +116,7 @@ _INFRA_ERROR_KEYWORDS = (
     "POLL ", "EXCEEDED 30", "PROXY", "TIMEOUT", "TIMED OUT",
     "INVENTORYRESERVATIONFAILURE", "NO SHOPIFY", "SESSION", "LIBCURL",
     "PROCESSING",
-    # ✅ NEW: dev shop + no payment gateways (infra errors مش declined)
-    "DEVELOPMENT SHOP", "NO PAYMENT GATEWAYS",
+    "DEVELOPMENT SHOP", "NO PAYMENT GATEWAYS",   # ← NEW
 )
 
 
@@ -381,10 +379,11 @@ async def route_check(
     elapsed     = round(time.monotonic() - t0, 2)
     card_status = result.get("status", "error")
 
-    # لو retry → متسجلهوش في errors
+    # لو PROCESSING → متسجلهوش في errors
     is_retry = bool(result.get("retry", False))
 
     if is_retry:
+        # محاولة → مش بتتحسب في stats
         _stats["active"] -= 1
         _log.info("%s|RETRY:%s", cc, result.get("result", "PROCESSING"))
         return JSONResponse({
