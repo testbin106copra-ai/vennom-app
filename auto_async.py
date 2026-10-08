@@ -64,6 +64,8 @@ patch_payload = _auto.patch_payload
 check_submit_errors = _auto.check_submit_errors
 generate_attempt_token = _auto.generate_attempt_token
 generate_page_id = _auto.generate_page_id
+
+# ✅ NEW: دوال كشف الـ import map الجديد
 extract_all_js_candidates = _auto.extract_all_js_candidates
 find_graphql_ids_in_html_and_js = _auto.find_graphql_ids_in_html_and_js
 is_development_shop = _auto.is_development_shop
@@ -974,7 +976,7 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
 
         # ─── Step 3: find GraphQL IDs ─────────────────────
         try:
-            # فحص development shop + gateways قبل أي حاجة
+            # ✅ فحص development shop + payment gateways
             if is_development_shop(checkout_html):
                 result.status = CheckStatus.ERROR
                 result.retryable = False
@@ -988,7 +990,7 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
                 return result
 
             proposal_id = ""
-            submit_id = ""
+            submit_id   = ""
 
             # المحاولة 1: actions.js القديم
             actions_url = extract_actions_js_url(checkout_html, shop_url)
@@ -996,11 +998,11 @@ async def run_checkout_for_card_async(shop_url: str, card_entry: str,
                 try:
                     js_body = await fetch_actions_js(client, actions_url, shop_url)
                     proposal_id = extract_proposal_id(js_body)
-                    submit_id = extract_submit_for_completion_id(js_body)
+                    submit_id   = extract_submit_for_completion_id(js_body)
                 except Exception:
                     pass
 
-            # المحاولة 2: الطريقة الجديدة (import map)
+            # ✅ المحاولة 2: import map الجديد
             if not proposal_id or not submit_id:
                 proposal_id, submit_id = await asyncio.to_thread(
                     find_graphql_ids_in_html_and_js, client, checkout_html, shop_url
